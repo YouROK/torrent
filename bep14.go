@@ -259,7 +259,7 @@ func (m *lpdConn) handleAnnouncePacket(client lpdClient, buf []byte, from *net.U
 	if m.mcPublisher != nil {
 		publisherAddr := m.mcPublisher.LocalAddr().(*net.UDPAddr)
 		if client.LocalPort() == addr.Port && from.IP.Equal(publisherAddr.IP) {
-			m.logger.Println("receiver", "Ignoring own message")
+			m.logger.LevelPrint(log.Debug, "received, ignoring own message")
 			return
 		}
 	}

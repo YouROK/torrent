@@ -761,6 +761,11 @@ func (t *Torrent) hashPiece(piece pieceIndex) (ret metainfo.Hash) {
 		missinggo.CopyExact(&ret, hash.Sum(nil))
 		return
 	}
+	// A short read with no error still means the piece couldn't be fully read.
+	// Normalize it so we don't log a nil error as "unexpected".
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
 	if err != io.ErrUnexpectedEOF && !os.IsNotExist(err) {
 		t.logger.Printf("unexpected error hashing piece with %T: %s", t.storage.TorrentImpl, err)
 	}
