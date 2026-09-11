@@ -265,7 +265,7 @@ func (m *lpdConn) handleAnnouncePacket(client lpdClient, buf []byte, from *net.U
 	}
 
 	m.lpd.mu.Lock()
-	m.logger.LevelPrint(log.Debug, "received, adding peer: ", addr.String())
+	m.logger.LevelPrint(log.Debug, "received, adding peer", addr.String())
 	m.lpd.peer(addr.String())
 	m.lpd.refresh()
 	m.lpd.mu.Unlock()
