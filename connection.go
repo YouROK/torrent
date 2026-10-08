@@ -566,8 +566,23 @@ func (cn *connection) fillWriteBuffer(msg func(pp.Message) bool) {
 		}
 	}
 	if len(cn.requests) <= cn.requestsLowWater {
+		if cn.t.networkingEnabled && cn.PeerChoked {
+			// Interest is about wanted pieces, independently of the peer's choke.
+			// Avoid scanning every chunk when only Allowed Fast requests can be sent.
+			if !cn.SetInterested(cn.peerHasWantedPieces(), msg) {
+				return
+			}
+			if !cn.hasWantedAllowedFastPiece() {
+				cn.requestsLowWater = len(cn.requests) / 2
+				cn.upload(msg)
+				return
+			}
+		}
 		filledBuffer := false
 		cn.iterPendingPieces(func(pieceIndex pieceIndex) bool {
+			if cn.PeerChoked && !cn.peerAllowedFast.Get(bitmap.BitIndex(pieceIndex)) {
+				return true
+			}
 			cn.iterPendingRequests(pieceIndex, func(r request) bool {
 				if !cn.SetInterested(true, msg) {
 					filledBuffer = true
@@ -601,6 +616,17 @@ func (cn *connection) fillWriteBuffer(msg func(pp.Message) bool) {
 	}
 
 	cn.upload(msg)
+}
+
+func (cn *connection) hasWantedAllowedFastPiece() bool {
+	found := false
+	cn.peerAllowedFast.IterTyped(func(i int) bool {
+		if cn.pieceRequestOrder.Contains(i) {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 // Routine that writes to the peer. Some of what to write is buffered by
