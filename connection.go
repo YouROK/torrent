@@ -1346,6 +1346,15 @@ func (c *connection) receiveChunk(msg *pp.Message) error {
 		return nil
 	}
 
+	// The piece may have left the readers' zones while the chunk was in flight. Writing it would
+	// leave a partial piece that is never completed, never requested again and never evicted
+	// promptly, so drop the data instead. Readers re-request the piece if they return to it.
+	if !t.pieceWanted(pieceIndex(req.Index)) {
+		torrent.Add("chunks received for unwanted pieces", 1)
+		c.allStats(add(1, func(cs *ConnStats) *Count { return &cs.ChunksReadWasted }))
+		return nil
+	}
+
 	piece := &t.pieces[req.Index]
 
 	c.allStats(add(1, func(cs *ConnStats) *Count { return &cs.ChunksReadUseful }))
