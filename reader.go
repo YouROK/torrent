@@ -21,6 +21,12 @@ type Reader interface {
 	// Configure the number of bytes ahead of a read that should also be prioritized in preparation
 	// for further reads.
 	SetReadahead(int64)
+	// Configure the number of bytes right after the read position that should be fetched with
+	// PiecePriorityNext.
+	SetNext(int64)
+	// Configure the total number of bytes after the read position that this reader wants
+	// downloaded. Pieces outside this zone are not requested.
+	SetZone(int64)
 	// Don't wait for pieces to complete and be verified. Read calls return as soon as they can when
 	// the underlying chunks become available.
 	SetResponsive()
@@ -37,14 +43,25 @@ type reader struct {
 	// Adjust the read/seek window to handle Readers locked to File extents and the like.
 	offset, length int64
 
-	// Required when modifying pos and readahead, or reading them without opMu.
+	// Required when modifying pos, readahead, next and zone, or reading them without opMu.
 	mu        sync.Locker
 	pos       int64
 	readahead int64
-	// The cached piece range this reader wants downloaded. The zero value corresponds to nothing.
-	// We cache this so that changes can be detected, and bubbled up to the Torrent only as
-	// required.
+	next      int64
+	zone      int64
+	// The cached piece ranges this reader wants downloaded, one per priority class. We cache these
+	// so that changes can be detected, and bubbled up to the Torrent only as required.
+	ranges readerRanges
+}
+
+// readerRanges is the set of piece ranges a reader wants, by priority class.
+type readerRanges struct {
+	// The readahead window. Its first piece is the one being read, the rest follow it.
 	pieces pieceRange
+	// The window right after the read position, fetched before the rest of the zone.
+	next pieceRange
+	// The whole download zone. Pieces beyond it are not requested at all.
+	zone pieceRange
 }
 
 var _ io.ReadCloser = (*reader)(nil)
@@ -63,6 +80,26 @@ func (r *reader) SetNonResponsive() {
 func (r *reader) SetReadahead(readahead int64) {
 	r.mu.Lock()
 	r.readahead = readahead
+	r.mu.Unlock()
+	r.t.cl.lock()
+	defer r.t.cl.unlock()
+	r.posChanged()
+}
+
+// SetNext sets the window right after the read position that is fetched with PiecePriorityNext.
+func (r *reader) SetNext(next int64) {
+	r.mu.Lock()
+	r.next = next
+	r.mu.Unlock()
+	r.t.cl.lock()
+	defer r.t.cl.unlock()
+	r.posChanged()
+}
+
+// SetZone sets the whole download zone of this reader. Pieces beyond it are not requested.
+func (r *reader) SetZone(zone int64) {
+	r.mu.Lock()
+	r.zone = zone
 	r.mu.Unlock()
 	r.t.cl.lock()
 	defer r.t.cl.unlock()
@@ -100,18 +137,40 @@ func (r *reader) waitReadable(off int64) {
 	r.t.cl.event.Wait()
 }
 
-// Calculates the pieces this reader wants downloaded, ignoring the cached value at r.pieces.
+// piecesUncached calculates the readahead range this reader wants downloaded, ignoring the cached
+// value at r.pieces. The run starts at the piece holding the read position, so at least one piece
+// is always wanted.
 func (r *reader) piecesUncached() (ret pieceRange) {
-	ra := r.readahead
-	if ra < 1 {
-		// Needs to be at least 1, because [x, x) means we don't want
-		// anything.
-		ra = 1
+	return r.rangeUncached(r.readahead, true)
+}
+
+// nextUncached calculates the pieces right after the read position that are fetched first.
+func (r *reader) nextUncached() (ret pieceRange) {
+	return r.rangeUncached(r.next, false)
+}
+
+// zoneUncached calculates the whole download zone of this reader. Pieces beyond it stay unwanted.
+func (r *reader) zoneUncached() (ret pieceRange) {
+	return r.rangeUncached(r.zone, false)
+}
+
+// rangeUncached maps a byte length ahead of the read position to a piece range. An includeFirst
+// run always covers the current piece, so that a stalled read keeps it wanted.
+func (r *reader) rangeUncached(length int64, includeFirst bool) (ret pieceRange) {
+	if length < 0 {
+		length = 0
 	}
-	if ra > r.length-r.pos {
-		ra = r.length - r.pos
+	if length > r.length-r.pos {
+		length = r.length - r.pos
 	}
-	ret.begin, ret.end = r.t.byteRegionPieces(r.torrentOffset(r.pos), ra)
+	if includeFirst && length < 1 {
+		// Needs to be at least 1, because [x, x) means we don't want anything.
+		length = 1
+	}
+	if length == 0 {
+		return
+	}
+	ret.begin, ret.end = r.t.byteRegionPieces(r.torrentOffset(r.pos), length)
 	return
 }
 
@@ -225,10 +284,10 @@ func (r *reader) readOnceAt(b []byte, pos int64, ctxErr *error) (n int, err erro
 		// Update the rest of the piece completions in the readahead window, without alerting to
 		// changes (since only the first piece, the one above, could have generated the read error
 		// we're currently handling).
-		if r.pieces.begin != firstPieceIndex {
-			panic(fmt.Sprint(r.pieces.begin, firstPieceIndex))
+		if r.ranges.pieces.begin != firstPieceIndex {
+			panic(fmt.Sprint(r.ranges.pieces.begin, firstPieceIndex))
 		}
-		for index := r.pieces.begin + 1; index < r.pieces.end; index++ {
+		for index := r.ranges.pieces.begin + 1; index < r.ranges.pieces.end; index++ {
 			r.t.updatePieceCompletion(index)
 		}
 		r.t.cl.unlock()
@@ -244,14 +303,21 @@ func (r *reader) Close() error {
 }
 
 func (r *reader) posChanged() {
-	to := r.piecesUncached()
-	from := r.pieces
+	to := r.rangesUncached()
+	from := r.ranges
 	if to == from {
 		return
 	}
-	r.pieces = to
-	// log.Printf("reader pos changed %v->%v", from, to)
+	r.ranges = to
 	r.t.readerPosChanged(from, to)
+}
+
+// rangesUncached recalculates every piece range this reader wants.
+func (r *reader) rangesUncached() (ret readerRanges) {
+	ret.pieces = r.piecesUncached()
+	ret.next = r.nextUncached()
+	ret.zone = r.zoneUncached()
+	return
 }
 
 func (r *reader) Seek(off int64, whence int) (ret int64, err error) {

@@ -121,7 +121,9 @@ type Torrent struct {
 
 	readers               map[*reader]struct{}
 	readerNowPieces       bitmap.Bitmap
+	readerNextPieces      bitmap.Bitmap
 	readerReadaheadPieces bitmap.Bitmap
+	readerZonePieces      bitmap.Bitmap
 
 	// A cache of pieces we need to get. Calculated from various piece and
 	// file priorities and completion states elsewhere.
@@ -826,9 +828,27 @@ func (t *Torrent) wantPieceIndex(index pieceIndex) bool {
 		return true
 	}
 	// t.logger.Printf("piece %d not pending", index)
-	return !t.forReaderOffsetPieces(func(begin, end pieceIndex) bool {
-		return index < begin || index >= end
-	})
+	return t.pieceInReaderZone(pieceRange{pieceIndex(index), pieceIndex(index) + 1})
+}
+
+// pieceInReaderZone reports whether any reader currently wants the given piece range.
+func (t *Torrent) pieceInReaderZone(r pieceRange) bool {
+	for rd := range t.readers {
+		z := rd.ranges.zone
+		if z.begin < z.end && r.begin < z.end && z.begin < r.end {
+			return true
+		}
+	}
+	return false
+}
+
+// pieceWanted reports whether the piece is still worth storing. A piece that no reader wants any
+// more and that is not pending must not be written, otherwise stale chunks keep resurrecting it.
+func (t *Torrent) pieceWanted(index pieceIndex) bool {
+	if t.pendingPieces.Contains(bitmap.BitIndex(index)) {
+		return true
+	}
+	return t.pieceInReaderZone(pieceRange{index, index + 1})
 }
 
 // The worst connection is one that hasn't been sent, or sent anything useful
@@ -889,30 +909,61 @@ func (t *Torrent) readersChanged() {
 }
 
 func (t *Torrent) updateReaderPieces() {
-	t.readerNowPieces, t.readerReadaheadPieces = t.readerPiecePriorities()
+	t.readerNowPieces, t.readerNextPieces, t.readerReadaheadPieces, t.readerZonePieces = t.readerPiecePriorities()
 }
 
-func (t *Torrent) readerPosChanged(from, to pieceRange) {
+func (t *Torrent) readerPosChanged(from, to readerRanges) {
 	if from == to {
 		return
 	}
 	t.updateReaderPieces()
-	// Order the ranges, high and low.
-	l, h := from, to
-	if l.begin > h.begin {
-		l, h = h, l
+	readerChangedPieces(from, to).IterTyped(func(i int) bool {
+		t.updatePiecePriority(pieceIndex(i))
+		return true
+	})
+}
+
+// readerChangedPieces returns the pieces whose tier may have changed between two reader positions.
+// Only these need re-evaluating, which keeps the cost of a read independent of the zone size.
+func readerChangedPieces(from, to readerRanges) (changed bitmap.Bitmap) {
+	addRangeDiff(&changed, from.pieces, to.pieces)
+	addRangeDiff(&changed, from.next, to.next)
+	addRangeDiff(&changed, from.zone, to.zone)
+	// The first piece of the window changes tier between Now and Readahead while staying inside both
+	// the old and the new window, so the range difference above never reports it. Both window
+	// starts must be re-evaluated explicitly, otherwise the piece being read keeps the stale tier.
+	addRangeBegin(&changed, from.pieces)
+	addRangeBegin(&changed, to.pieces)
+	return
+}
+
+// addRangeBegin marks the first piece of a range.
+func addRangeBegin(dst *bitmap.Bitmap, a pieceRange) {
+	if a.begin < a.end {
+		dst.Add(bitmap.BitIndex(a.begin))
 	}
-	if l.end < h.begin {
-		// Two distinct ranges.
-		t.updatePiecePriorities(l.begin, l.end)
-		t.updatePiecePriorities(h.begin, h.end)
-	} else {
-		// Ranges overlap.
-		end := l.end
-		if h.end > end {
-			end = h.end
-		}
-		t.updatePiecePriorities(l.begin, end)
+}
+
+// addRangeDiff marks the pieces that are in exactly one of the two ranges.
+func addRangeDiff(dst *bitmap.Bitmap, a, b pieceRange) {
+	addRangeSub(dst, a, b)
+	addRangeSub(dst, b, a)
+}
+
+// addRangeSub marks the pieces of a that are not in b.
+func addRangeSub(dst *bitmap.Bitmap, a, b pieceRange) {
+	if a.begin >= a.end {
+		return
+	}
+	if b.begin >= b.end || b.end <= a.begin || b.begin >= a.end {
+		dst.AddRange(bitmap.BitIndex(a.begin), bitmap.BitIndex(a.end))
+		return
+	}
+	if a.begin < b.begin {
+		dst.AddRange(bitmap.BitIndex(a.begin), bitmap.BitIndex(b.begin))
+	}
+	if a.end > b.end {
+		dst.AddRange(bitmap.BitIndex(b.end), bitmap.BitIndex(a.end))
 	}
 }
 
@@ -987,7 +1038,7 @@ func (t *Torrent) byteRegionPieces(off, size int64) (begin, end pieceIndex) {
 // callers depend on this method to enumerate readers.
 func (t *Torrent) forReaderOffsetPieces(f func(begin, end pieceIndex) (more bool)) (all bool) {
 	for r := range t.readers {
-		p := r.pieces
+		p := r.ranges.pieces
 		if p.begin >= p.end {
 			continue
 		}
@@ -1134,14 +1185,25 @@ func (t *Torrent) maybeCompleteMetadata() error {
 	return nil
 }
 
-func (t *Torrent) readerPiecePriorities() (now, readahead bitmap.Bitmap) {
-	t.forReaderOffsetPieces(func(begin, end pieceIndex) bool {
-		if end > begin {
-			now.Add(bitmap.BitIndex(begin))
-			readahead.AddRange(bitmap.BitIndex(begin)+1, bitmap.BitIndex(end))
+// readerPiecePriorities returns the pieces wanted by each reader tier: the piece being read, the
+// Next window right after it, the rest of the readahead window and the full download zone. A piece
+// may fall into several tiers; the highest one wins when priorities are applied.
+func (t *Torrent) readerPiecePriorities() (now, next, readahead, zone bitmap.Bitmap) {
+	for r := range t.readers {
+		p := r.ranges.pieces
+		if p.begin < p.end {
+			now.Add(bitmap.BitIndex(p.begin))
+			readahead.AddRange(bitmap.BitIndex(p.begin)+1, bitmap.BitIndex(p.end))
 		}
-		return true
-	})
+		n := r.ranges.next
+		if n.begin < n.end {
+			next.AddRange(bitmap.BitIndex(n.begin), bitmap.BitIndex(n.end))
+		}
+		z := r.ranges.zone
+		if z.begin < z.end {
+			zone.AddRange(bitmap.BitIndex(z.begin), bitmap.BitIndex(z.end))
+		}
+	}
 	return
 }
 

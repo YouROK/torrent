@@ -737,7 +737,7 @@ func iterBitmapsDistinct(skip *bitmap.Bitmap, bms ...bitmap.Bitmap) iter.Func {
 }
 
 func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) bool) bool {
-	now, readahead := cn.t.readerPiecePriorities()
+	now, next, readahead, zone := cn.t.readerPiecePriorities()
 	var skip bitmap.Bitmap
 	if !cn.peerSentHaveAll {
 		// Pieces to skip include pieces the peer doesn't have.
@@ -756,7 +756,7 @@ func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) boo
 			}
 			return f(pieceIndex(i))
 		},
-		iterBitmapsDistinct(&skip, now, readahead),
+		iterBitmapsDistinct(&skip, now, next, readahead, zone),
 		func(cb iter.Callback) {
 			cn.t.pendingPieces.IterTyped(func(piece int) bool {
 				if skip.Contains(piece) {

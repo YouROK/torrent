@@ -213,6 +213,9 @@ func (p *Piece) SetPriority(prio piecePriority) {
 	p.t.updatePiecePriority(p.index)
 }
 
+// uncachedPriority derives the piece priority from the reader tiers alone. It is a pure function of
+// the readers' positions, so it never needs to be reset: a piece that no reader wants any more
+// simply falls back to None and stops being requested.
 func (p *Piece) uncachedPriority() (ret piecePriority) {
 	if p.t.pieceComplete(p.index) || p.t.pieceQueuedForHash(p.index) || p.t.hashingPiece(p.index) {
 		return PiecePriorityNone
@@ -223,12 +226,17 @@ func (p *Piece) uncachedPriority() (ret piecePriority) {
 	if p.t.readerNowPieces.Contains(int(p.index)) {
 		ret.Raise(PiecePriorityNow)
 	}
-	// if t.readerNowPieces.Contains(piece - 1) {
-	// 	return PiecePriorityNext
-	// }
+	if p.t.readerNextPieces.Contains(bitmap.BitIndex(p.index)) {
+		ret.Raise(PiecePriorityNext)
+	}
 	if p.t.readerReadaheadPieces.Contains(bitmap.BitIndex(p.index)) {
 		ret.Raise(PiecePriorityReadahead)
 	}
+	if p.t.readerZonePieces.Contains(bitmap.BitIndex(p.index)) {
+		ret.Raise(PiecePriorityNormal)
+	}
+	// An explicit Piece.SetPriority still wins. Callers that drive priorities from reader tiers
+	// leave it at None, which makes this a no-op.
 	ret.Raise(p.priority)
 	return
 }
