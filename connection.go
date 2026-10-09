@@ -813,17 +813,33 @@ func (cn *connection) iterPendingPiecesUntyped(f iter.Callback) {
 	cn.iterPendingPieces(func(i pieceIndex) bool { return f(i) })
 }
 
+// maxStallProneRequests is how many connections may hold the same chunk of the piece under a
+// reader at once. One copy risks waiting out a slow peer; unbounded copies let every peer pile onto
+// the few missing chunks, draining the request budget from the rest of the zone.
+const maxStallProneRequests = 3
+
 func (cn *connection) iterPendingRequests(piece pieceIndex, f func(request) bool) bool {
+	// The piece a reader is sitting on gates playback: a stalled read waits for its last chunks,
+	// while the pieces ahead are only needed early. The duplicate request timer below hides a
+	// requested chunk from every other peer for duplicateRequestTimeout, which is fine for the rest
+	// of the zone but leaves the current piece waiting on whichever peer got there first. Let that
+	// piece be fetched by a few peers instead: the first chunk to arrive wins, the rest are wasted.
+	stallProne := cn.t.readerNowPieces.Contains(bitmap.BitIndex(piece))
 	return iterUndirtiedChunks(piece, cn.t, func(cs chunkSpec) bool {
 		r := request{pp.Integer(piece), cs}
 		if cn.t.requestStrategy == 3 {
 			cn.t.lastRequestedMu.RLock()
-			_, ok := cn.t.lastRequested[r]
+			_, requested := cn.t.lastRequested[r]
 			cn.t.lastRequestedMu.RUnlock()
-			if ok {
-				// This piece has been requested on another connection, and
-				// the duplicate request timer is still running.
-				return true
+			if requested {
+				if !stallProne {
+					// This piece has been requested on another connection, and
+					// the duplicate request timer is still running.
+					return true
+				}
+				if cn.t.inFlightRequests(r) >= maxStallProneRequests {
+					return true
+				}
 			}
 		}
 		return f(r)

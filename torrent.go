@@ -1289,6 +1289,13 @@ func (t *Torrent) assertNoPendingRequests() {
 	}
 }
 
+// inFlightRequests reports how many connections have the same chunk requested and not yet received.
+func (t *Torrent) inFlightRequests(r request) int {
+	t.pendingRequestsMu.RLock()
+	defer t.pendingRequestsMu.RUnlock()
+	return t.pendingRequests[r]
+}
+
 func (t *Torrent) dropConnection(c *connection) {
 	t.cl.event.Broadcast()
 	c.Close()
